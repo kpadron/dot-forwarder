@@ -116,6 +116,7 @@ async def upstream_forward(upstream, query):
 
 	try:
 		# Establish upstream connection
+		reader, writer = None, None
 		reader, writer = await asyncio.open_connection(upstream[0], upstream[1], ssl=True, server_hostname=upstream[2])
 
 		# Forward request upstream
@@ -130,9 +131,6 @@ async def upstream_forward(upstream, query):
 		# Update estimated RTT for this upstream connection
 		upstream[3] = 0.875 * upstream[3] + 0.125 * rtt
 
-		# Teardown upstream connection
-		writer.close()
-
 		# Return response
 		return answer
 
@@ -140,6 +138,11 @@ async def upstream_forward(upstream, query):
 		print('Encountered exception while attempting to forward query to upstream ' + str(exc))
 		upstream[3] = upstream[3] + 1
 		return b'\x00\x00'
+
+	finally:
+		# Teardown upstream connection
+		if writer is not None:
+			writer.close()
 
 
 def upstream_select(upstreams):
