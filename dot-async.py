@@ -5,8 +5,11 @@ import random, datetime
 
 listen_host = '127.0.0.1'
 listen_port = 5053
-upstreams = [['1.1.1.1', 853, 'cloudflare-dns.com', 0], ['9.9.9.9', 853, 'dns.quad9.net', 0]]
-index = 0
+upstreams = [
+	['1.1.1.1', 853, 'cloudflare-dns.com', 0.0],
+	['8.8.8.8', 853, 'dns.google', 0.0],
+	['9.9.9.9', 853, 'dns.quad9.net', 0.0],
+	]
 
 
 def main():
@@ -86,9 +89,7 @@ class TcpDotProtocol(asyncio.Protocol):
 
 	async def process_packet(self, query):
 		# Select upstream server to forward to
-		global index
-		upstream = upstreams[index]
-		index = (index + 1) % len(upstreams)
+		upstream = upstream_select(upstreams)
 
 		# Forward DNS query to upstream server
 		answer = await upstream_forward(upstream, query)
@@ -116,7 +117,7 @@ async def upstream_forward(upstream, query):
 	try:
 		# Establish upstream connection
 		reader, writer = await asyncio.open_connection(upstream[0], upstream[1], ssl=True, server_hostname=upstream[2])
-		
+
 		# Forward request upstream
 		writer.write(query)
 		await writer.drain()
@@ -125,7 +126,7 @@ async def upstream_forward(upstream, query):
 		# Wait for response
 		answer = await reader.read(65537)
 		rtt = get_epoch_ms() - rtt
-		
+
 		# Update estimated RTT for this upstream connection
 		upstream[3] = 0.875 * upstream[3] + 0.125 * rtt
 
@@ -134,19 +135,33 @@ async def upstream_forward(upstream, query):
 
 		# Return response
 		return answer
-	
+
 	except Exception as exc:
-		print(exc)
+		print('Encountered exception while attempting to forward query to upstream ' + str(exc))
 		upstream[3] = upstream[3] + 1
 		return b'\x00\x00'
 
 
 def upstream_select(upstreams):
+	"""
+	Select a upstream server to connect to (biases towards upstreams with lower rtt).
+
+	Params:
+		upstreams - list of upstream servers
+
+	Returns:
+		The selected upstream server.
+	"""
+
 	max_rtt = max([upstream[3] for upstream in upstreams])
 	return random.choices(upstreams, [max_rtt - upstream[3] + 1 for upstream in upstreams])[0]
 
 
 def get_epoch_ms():
+	"""
+	Returns the current number of milliseconds since the Epoch.
+	"""
+
 	return (datetime.datetime.utcnow() - datetime.datetime.utcfromtimestamp(0)).total_seconds() * 1000.0
 
 
