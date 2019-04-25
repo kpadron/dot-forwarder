@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-import asyncio, aiohttp
-import random
+import asyncio, struct
+import random, datetime
 
 
-host = '127.0.0.1'
-port = 5053
-headers = {'accept': 'application/dns-message', 'content-type': 'application/dns-message'}
-upstreams = ['https://1.1.1.1/dns-query', 'https://1.0.0.1/dns-query']
-conns = []
+listen_host = '127.0.0.1'
+listen_port = 5053
+upstreams = [['1.1.1.1', 853, 'cloudflare-dns.com', 0], ['9.9.9.9', 853, 'dns.quad9.net', 0]]
+index = 0
 
 
 def main():
-	# Setup event loop and UDP server
-	print('Starting UDP server listening on: %s#%d' % (host, port))
 	loop = asyncio.get_event_loop()
-	listen = loop.create_datagram_endpoint(DohProtocol, local_addr = (host, port))
-	transport, protocol = loop.run_until_complete(listen)
+	transports = []
 
-	# Connect to upstream servers
-	for upstream in upstreams:
-		print('Connecting to upstream server: %s' % (upstream))
-		conns.append(loop.run_until_complete(upstream_connect()))
+	# Setup listening servers
+	print('Starting UDP server listening on %s#%d' % (listen_host, listen_port))
+	udp_listen = loop.create_datagram_endpoint(UdpDotProtocol, (listen_host, listen_port), reuse_address=True)
+	transport, _ = loop.run_until_complete(udp_listen)
+	transports.append(transport)
+	print('Starting TCP server listening on %s#%d' % (listen_host, listen_port))
+	tcp_listen = loop.create_server(TcpDotProtocol, listen_host, listen_port, reuse_address=True)
+	transport = loop.run_until_complete(tcp_listen)
+	transports.append(transport)
 
 	# Serve forever
 	try:
@@ -28,88 +29,125 @@ def main():
 	except (KeyboardInterrupt, SystemExit):
 		pass
 
-	# Close upstream connections
-	for conn in conns:
-		loop.run_until_complete(upstream_close(conn))
+	# Close listening servers
+	for transport in transports:
+		transport.close()
 
-	# Close UDP server and event loop
-	transport.close()
+	loop.run_until_complete(asyncio.sleep(0.3))
 	loop.close()
 
 
-class DohProtocol(asyncio.DatagramProtocol):
+class UdpDotProtocol(asyncio.DatagramProtocol):
 	"""
-	DNS over HTTPS protocol to use with asyncio.
+	Protocol for serving UDP DNS requests via DNS over TLS.
 	"""
 
 	def connection_made(self, transport):
 		self.transport = transport
 
-	def datagram_received(self, data, addr):
-		# Schedule packet forwarding coroutine
-		asyncio.ensure_future(self.forward_packet(data, addr))
-
 	def connection_lost(self, exc):
 		pass
 
-	async def forward_packet(self, data, addr):
+	def datagram_received(self, data, addr):
+		# Schedule packet forwarding coroutine
+		asyncio.ensure_future(self.process_packet(addr, data))
+
+	def error_received(self, exc):
+		print(exc)
+
+	async def process_packet(self, addr, query):
 		# Select upstream server to forward to
-		index = random.randrange(len(upstreams))
+		upstream = upstream_select(upstreams)
 
-		# Await upstream forwarding coroutine
-		data = await upstream_forward(upstreams[index], data, conns[index])
+		# Forward DNS query to upstream server
+		answer = await upstream_forward(upstream, struct.pack('!H', len(query)) + query)
 
-		# Send DNS packet to client
-		self.transport.sendto(data, addr)
+		# Forward DNS answer to client
+		self.transport.sendto(answer[2:], addr)
 
 
-async def upstream_connect():
+class TcpDotProtocol(asyncio.Protocol):
 	"""
-	Create an upstream connection that will later be bound to a url.
-
-	Returns:
-		A aiohttp session object
+	Protocol for serving TCP DNS requests via DNS over TLS.
 	"""
 
-	# Create connection with default DNS message headers
-	return aiohttp.ClientSession(headers=headers)
+	def connection_made(self, transport):
+		self.transport = transport
+
+	def connection_lost(self, exc):
+		if not self.transport.is_closing():
+			self.transport.close()
+
+	def data_received(self, data):
+		asyncio.ensure_future(self.process_packet(data))
+
+	def eof_received(self):
+		return None
+
+	async def process_packet(self, query):
+		# Select upstream server to forward to
+		global index
+		upstream = upstreams[index]
+		index = (index + 1) % len(upstreams)
+
+		# Forward DNS query to upstream server
+		answer = await upstream_forward(upstream, query)
+
+		# Forward DNS answer to client
+		self.transport.write(answer)
 
 
-async def upstream_forward(url, data, conn):
+async def upstream_forward(upstream, query):
 	"""
-	Send a DNS request over HTTPS using POST method.
+	Forward a DNS request to a upstream server using TLS.
 
 	Params:
-		url  - url to forward queries to
-		data - normal DNS packet data to forward
-		conn - HTTPS connection to upstream DNS server
+		upstream - upstream server to forward requests to
+		query    - wireformat DNS request packet to forward (length prefixed)
 
 	Returns:
-		A normal DNS response packet from upstream server
+		A wireformat DNS response packet (length prefixed)
 
 	Notes:
-		Using DNS over HTTPS POST format as described here:
-		https://tools.ietf.org/html/draft-ietf-doh-dns-over-https-12
-		https://developers.cloudflare.com/1.1.1.1/dns-over-https/wireformat/
+		Using DNS over TLS format as described here:
+		https://tools.ietf.org/html/rfc7858
 	"""
 
-	# Await upstream response
-	async with conn.post(url, data=data) as response:
-		if response.status != 200:
-			print('%s (%d): IN %s, OUT %s' % (url, response.status, data, await response.read()))
+	try:
+		# Establish upstream connection
+		reader, writer = await asyncio.open_connection(upstream[0], upstream[1], ssl=True, server_hostname=upstream[2])
+		
+		# Forward request upstream
+		writer.write(query)
+		await writer.drain()
+		rtt = get_epoch_ms()
 
-		return await response.read()
+		# Wait for response
+		answer = await reader.read(65537)
+		rtt = get_epoch_ms() - rtt
+		
+		# Update estimated RTT for this upstream connection
+		upstream[3] = 0.875 * upstream[3] + 0.125 * rtt
+
+		# Teardown upstream connection
+		writer.close()
+
+		# Return response
+		return answer
+	
+	except Exception as exc:
+		print(exc)
+		upstream[3] = upstream[3] + 1
+		return b'\x00\x00'
 
 
-async def upstream_close(conn):
-	"""
-	Close an upstream connection.
+def upstream_select(upstreams):
+	max_rtt = max([upstream[3] for upstream in upstreams])
+	return random.choices(upstreams, [max_rtt - upstream[3] + 1 for upstream in upstreams])[0]
 
-	Params:
-		conn - aiohttp session object to close
-	"""
 
-	await conn.close()
+def get_epoch_ms():
+	return (datetime.datetime.utcnow() - datetime.datetime.utcfromtimestamp(0)).total_seconds() * 1000.0
 
 
 if __name__ == '__main__':

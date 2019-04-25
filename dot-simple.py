@@ -3,22 +3,28 @@ import socket, ssl
 import struct, random
 
 
-host = '127.0.0.1'
-port = 5053
-upstreams = ['1.1.1.1']
+listen_host = '127.0.0.1'
+listen_port = 5053
+upstreams = [('1.1.1.1', 853, 'cloudflare-dns.com')]
 conns = []
 
 
 def main():
 	# Setup UDP server
-	print('Starting UDP server listening on: %s#%d' % (host, port))
+	print('Starting UDP server listening on: %s#%d' % (listen_host, listen_port))
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	sock.bind((host, port))
+	sock.bind((listen_host, listen_port))
 
 	# Connect to upstream servers
 	for upstream in upstreams:
-		print('Connecting to upstream server: %s' % (upstream))
-		conns.append(upstream_connect(upstream, 853, 'cloudflare-dns.com'))
+		conn = upstream_connect(*upstream)
+		
+		if conn is None:
+			print('Failed to connect to upstream server: %s#%u' % (upstream[0], upstream[1]))
+			continue
+		
+		print('Successfully connected to upstream server: %s#%u' % (upstream[0], upstream[1]))
+		conns.append(conn)
 
 	# Serve forever
 	try:
@@ -30,7 +36,7 @@ def main():
 			index = random.randrange(len(conns))
 
 			# Forward request to upstream server and get response
-			data = upstream_forward(data, conns[index])
+			data = upstream_forward(conns[index], data)
 
 			# Send response to client
 			sock.sendto(data, addr)
@@ -47,7 +53,7 @@ def main():
 
 def upstream_connect(host, port, server_name):
 	"""
-	Create an upstream connection to a server.
+	Establish a secure SSL/TLS connection to a upstream server.
 
 	Params:
 		host        - host server to connect to
@@ -55,64 +61,60 @@ def upstream_connect(host, port, server_name):
 		server_name - hostname to use for certificate verification
 
 	Returns:
-		A secure socket object
+		A connected socket object or None on failure
 	"""
 
-	context = ssl.create_default_context()
+	try:
+		# Create TCP socket
+		sock = socket.socket()
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+		sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 3)
+		sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-	# Create socket connection
-	sock = socket.create_connection((host, port))
-	sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-	sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 1)
-	sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
-	sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+		# Wrap connection with SSL/TLS
+		context = ssl.create_default_context()
+		sock = context.wrap_socket(sock, server_hostname=server_name)
 
-	# Wrap connection with SSL/TLS
-	ssock = context.wrap_socket(sock, server_hostname=server_name)
-	print(ssock.version())
+		# Connect to upstream server
+		sock.connect((host, port))
+		return sock
 
-	return ssock
+	except (OSError, ssl.SSLError) as exc:
+		print(exc)
+		return None
 
 
-def upstream_forward(data, ssock):
+def upstream_close(sock):
 	"""
-	Send a DNS request over TLS.
+	Teardown a secure SSL/TLS connection to a upstream server.
 
 	Params:
-		data  - normal DNS packet data to forward
-		ssock - SSL/TLS socket connection to upstream DNS server
+		sock - secure socket object to close
+	"""
+
+	# Close underlying socket connection
+	sock.shutdown(socket.SHUT_RDWR)
+	sock.close()
+
+
+def upstream_forward(sock, data):
+	"""
+	Forward a DNS request to a upstream server using TLS.
+
+	Params:
+		sock - socket object connected to upstream server
+		data - wireformat DNS request packet to forward
 
 	Returns:
-		A normal DNS response packet from upstream server
+		A wireformat DNS response packet
 
 	Notes:
 		Using DNS over TLS format as described here:
 		https://tools.ietf.org/html/rfc7858
 	"""
 
-	# print('sending to upstream: %s' % (data))
-
-	ssock.send(struct.pack('! H', len(data)) + data)
-
-	data = ssock.recv(4096)
-	# print('receiving from upstream: %s' % (data))
-
-	return data[2:]
-
-
-def upstream_close(ssock):
-	"""
-	Close an upstream connection.
-
-	Params:
-		ssock - secure socket object to close
-	"""
-
-	# Unwrap secure socket connection
-	sock = ssock.unwrap()
-
-	# Close underlying socket connection
-	sock.close()
+	sock.send(struct.pack('!H', len(data)) + data)
+	return sock.recv(4096)[2:]
 
 
 if __name__ == '__main__':
