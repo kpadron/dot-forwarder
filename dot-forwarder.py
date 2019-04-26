@@ -144,7 +144,7 @@ class DotResolver:
 		self._queries = 0
 		self._answers = 0
 
-	def _select_upstream_rtt_biased(self):
+	def _select_upstream_rtt(self):
 		"""
 		Select a upstream server to forward to (biases towards upstreams with lower rtt).
 
