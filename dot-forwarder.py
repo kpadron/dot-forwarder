@@ -155,6 +155,16 @@ class DotResolver:
 		max_rtt = max([upstream.rtt for upstream in self._upstreams])
 		return random.choices(self._upstreams, [max_rtt - upstream.rtt + 1 for upstream in self._upstreams])[0]
 
+	def _select_upstream_random(self):
+		"""
+		Select a upstream server to forward to (random even distribution).
+
+		Returns:
+			The selected upstream server.
+		"""
+
+		return self._upstreams[random.randint(0, len(self._upstreams) - 1)]
+
 	async def resolve(self, query):
 		"""
 		Resolve DNS query via forwarding to upstream DoT server.
@@ -174,7 +184,7 @@ class DotResolver:
 
 		try:
 			# Select upstream to connect to
-			upstream = self._select_upstream_rtt_biased()
+			upstream = self._select_upstream_rtt()
 
 			# Establish upstream connection
 			stream = await upstream.get_stream()
