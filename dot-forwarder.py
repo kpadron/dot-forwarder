@@ -203,7 +203,7 @@ class DotResolver:
 			# Update estimated RTT for this upstream connection
 			upstream.rtt = 0.875 * upstream.rtt + 0.125 * rtt
 
-			# Reset RTT every 1000 processed requests to prevent starvation
+			# Reset RTT every 1000 processed requests to prevent drift
 			if self._answers % 1000 == 0:
 				for u in self._upstreams:
 					print(u.get_stats())
@@ -248,7 +248,7 @@ class UdpDotProtocol(asyncio.DatagramProtocol):
 		# Resolve DNS query
 		answer = await self.resolver.resolve(struct.pack('!H', len(query)) + query)
 
-		# Forward DNS answer to client
+		# Send DNS answer to client
 		self.transport.sendto(answer[2:], addr)
 
 
