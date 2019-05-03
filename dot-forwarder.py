@@ -144,7 +144,7 @@ class DotResolver:
 		self._queries = 0
 		self._answers = 0
 
-	def _select_upstream_rtt_biased(self):
+	def _select_upstream_rtt(self):
 		"""
 		Select a upstream server to forward to (biases towards upstreams with lower rtt).
 
@@ -154,6 +154,16 @@ class DotResolver:
 
 		max_rtt = max([upstream.rtt for upstream in self._upstreams])
 		return random.choices(self._upstreams, [max_rtt - upstream.rtt + 1 for upstream in self._upstreams])[0]
+
+	def _select_upstream_random(self):
+		"""
+		Select a upstream server to forward to (random even distribution).
+
+		Returns:
+			The selected upstream server.
+		"""
+
+		return self._upstreams[random.randint(0, len(self._upstreams) - 1)]
 
 	async def resolve(self, query):
 		"""
@@ -174,7 +184,7 @@ class DotResolver:
 
 		try:
 			# Select upstream to connect to
-			upstream = self._select_upstream_rtt_biased()
+			upstream = self._select_upstream_rtt()
 
 			# Establish upstream connection
 			stream = await upstream.get_stream()
@@ -193,7 +203,7 @@ class DotResolver:
 			# Update estimated RTT for this upstream connection
 			upstream.rtt = 0.875 * upstream.rtt + 0.125 * rtt
 
-			# Reset RTT every 1000 processed requests to prevent starvation
+			# Reset RTT every 1000 processed requests to prevent drift
 			if self._answers % 1000 == 0:
 				for u in self._upstreams:
 					print(u.get_stats())
@@ -238,7 +248,7 @@ class UdpDotProtocol(asyncio.DatagramProtocol):
 		# Resolve DNS query
 		answer = await self.resolver.resolve(struct.pack('!H', len(query)) + query)
 
-		# Forward DNS answer to client
+		# Send DNS answer to client
 		self.transport.sendto(answer[2:], addr)
 
 
