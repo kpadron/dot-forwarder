@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import socket, ssl
 import struct, random
-import datetime, asyncio
-import copy
+import time, asyncio
 
 
 def main():
@@ -42,14 +41,6 @@ def main():
 
 	loop.run_until_complete(asyncio.sleep(0.3))
 	loop.close()
-
-
-def get_epoch_ms():
-	"""
-	Returns the current number of milliseconds since the Epoch.
-	"""
-
-	return (datetime.datetime.utcnow() - datetime.datetime.utcfromtimestamp(0)).total_seconds() * 1000.0
 
 
 class TransportStream:
@@ -115,14 +106,11 @@ class UpstreamContext:
 		"""
 		Returns a transport stream to be used for forwarding queries upstream.
 		"""
-
-		self._stream_handle = self._stream_handle + 1
-		handle = copy.deepcopy(self._stream_handle)
-		stream = await self._open_stream(handle)
-		self._streams[handle] = stream
 		self.queries += 1
 
-		return stream
+		handle = self._stream_handle
+		self._stream_handle += 1
+		return await self._open_stream(handle)
 
 	def release_stream(self, stream_handle):
 		"""
@@ -192,12 +180,12 @@ class DotResolver:
 			# Forward request upstream
 			stream.writer.write(query)
 			await stream.writer.drain()
-			rtt = get_epoch_ms()
+			rtt = time.monotonic()
 			self._queries += 1
 
 			# Wait for response
 			answer = await stream.reader.read(65537)
-			rtt = get_epoch_ms() - rtt
+			rtt = time.monotonic() - rtt
 			self._answers += 1
 
 			# Update estimated RTT for this upstream connection
