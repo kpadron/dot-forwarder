@@ -1,9 +1,77 @@
 #!/usr/bin/env python3
-import struct, random, logging, time
+import struct, random, time
+import argparse, logging
 import asyncio as aio
 import dnslib as dns
 import dnslib.server as dns_server
 from typing import Sequence
+
+def main():
+	loop = aio.get_event_loop()
+
+	# Handle command line arguments
+	parser = argparse.ArgumentParser()
+	parser.add_argument('-l', '--listen-address', nargs='+', default=['127.0.0.1', '::1'],
+						help='addresses to listen on for DNS over TLS requests (default: %(default)s)')
+	parser.add_argument('-p', '--listen-port', nargs='+', type=int, default=[53],
+						help='ports to listen on for DNS over TLS requests (default: %(default)s)')
+	parser.add_argument('-u', '--upstreams', nargs='+', default=['1.1.1.1', '1.0.0.1'],
+						help='upstream servers to forward DNS queries and requests to (default: %(default)s)')
+	parser.add_argument('-a', '--authnames', nargs='+', default=['cloudflare-dns.com', 'cloudflare-dns.com'],
+						help='hostname of upstream servers used for verification (default: %(default)s)')
+	parser.add_argument('-t', '--tcp', action='store_true', default=False,
+						help='serve TCP based queries and requests along with UDP (default: %(default)s)')
+	args = parser.parse_args()
+
+	# Setup logging
+	logging.basicConfig(level='INFO', format='[%(levelname)s] %(message)s')
+	logging.info('Starting DNS over TLS proxy server')
+	logging.info('Args: %r' % (vars(args)))
+
+	# Setup upstream configuration
+	upstreams = []
+	for upstream, authname in zip(args.upstreams, args.authnames):
+		upstreams.append(DotUpstream((upstream, 853), authname))
+
+	# Initialize DNS over TLS resolver
+	resolver = DotResolver(tuple(upstreams))
+
+	# Setup listening transports
+	transports = []
+	for address in args.listen_address:
+		for port in args.listen_port:
+			# Setup UDP server
+			logging.info('Starting UDP server listening on [%s#%d]' % (address, port))
+			udp = loop.create_datagram_endpoint(lambda: DotUdpServer(resolver), (address, port), reuse_address=True)
+			udp, _ = loop.run_until_complete(udp)
+			transports.append(udp)
+
+			# Setup TCP server
+			if args.tcp:
+				logging.info('Starting TCP server listening on [%s#%d]' % (address, port))
+				tcp = aio.start_server(DotTcpServer(resolver).service_client, address, port, reuse_address=True)
+				tcp = loop.run_until_complete(tcp)
+				transports.append(tcp)
+
+	# Serve forever
+	try:
+		loop.run_forever()
+	except (KeyboardInterrupt, SystemExit):
+		logging.info('Stopping DNS over TLS proxy server')
+
+	# Close listening servers
+	logging.info('Closing listening servers')
+	for transport in transports:
+		transport.close()
+
+	# Disconnect from all upstream servers
+	logging.info('Closing upstream connections')
+	loop.run_until_complete(resolver.close())
+
+	# Cleanup event loop
+	loop.run_until_complete(loop.shutdown_asyncgens())
+	loop.run_until_complete(aio.sleep(0.3))
+	loop.close()
 
 
 class DotStream:
@@ -88,18 +156,6 @@ class DotUpstream:
 	def rtt(self, rtt: float) -> None:
 		self._rtt = rtt
 
-	def _select_stream(self) -> DotStream:
-		for stream in self._streams:
-			if not stream.in_use() and not stream.is_closed():
-				break
-		else:
-			stream = None
-
-		if stream is not None:
-			return stream
-
-		return random.choice(self._streams)
-
 	async def close(self) -> None:
 		for stream in self._streams:
 			await stream.disconnect()
@@ -119,30 +175,41 @@ class DotUpstream:
 		self._rtt = 0.875 * self._rtt + 0.125 * rtt
 		return answer
 
+	def _select_stream(self) -> DotStream:
+		for stream in self._streams:
+			if not stream.in_use() and not stream.is_closed():
+				break
+		else:
+			stream = None
+
+		if stream is not None:
+			return stream
+
+		return random.choice(self._streams)
+
 
 class DotResolver:
 	max_retries: int = 2
 
-	def __init__(self, upstreams: Sequence[DotUpstream]) -> None:
+	def __init__(self, upstreams: Sequence[DotUpstream]):
 		assert len(upstreams), 'A non-empty sequence of DotUpstream is required'
 		self._upstreams = upstreams
-
-	def _select_upstream_random(self) -> DotUpstream:
-		return random.choice(self._upstreams)
-
-	def _select_upstream_rtt(self) -> DotUpstream:
-		max_rtt: float = max(upstream.rtt for upstream in self._upstreams)
-		return random.choices(self._upstreams, tuple(max_rtt - upstream.rtt + 1.0 for upstream in self._upstreams))[0]
+		self._queries = 0
 
 	async def close(self) -> None:
 		for upstream in self._upstreams:
 			await upstream.close()
 
 	async def resolve(self, request: dns.DNSRecord) -> dns.DNSRecord:
-		response = request.reply()
-
 		try:
-			for _ in range(self.max_retries + 1):
+			response = request.reply()
+
+			self._queries += 1
+			if self._queries % 10000 == 0:
+				for upstream in self._upstreams:
+					upstream.rtt = 0.0
+
+			for _ in range(DotResolver.max_retries + 1):
 				upstream = self._select_upstream_rtt()
 				answer = await upstream.forward_query(request.pack())
 
@@ -153,7 +220,7 @@ class DotResolver:
 					# response.add_ar(*reply.ar)
 					break
 			else:
-				raise Exception('DotResolver::resolve max retries exceeded')
+				raise Exception('max retries exceeded')
 
 		except Exception as exc:
 			logging.error('DotResolver::resolve ' + repr(exc))
@@ -161,6 +228,13 @@ class DotResolver:
 
 		finally:
 			return response
+
+	def _select_upstream_random(self) -> DotUpstream:
+		return random.choice(self._upstreams)
+
+	def _select_upstream_rtt(self) -> DotUpstream:
+		max_rtt: float = max(upstream.rtt for upstream in self._upstreams)
+		return random.choices(self._upstreams, tuple(max_rtt - upstream.rtt + 1.0 for upstream in self._upstreams))[0]
 
 
 class DotUdpServer(aio.DatagramProtocol):
@@ -185,69 +259,61 @@ class DotUdpServer(aio.DatagramProtocol):
 	async def process_query(self, client: tuple, query: bytes) -> None:
 		try:
 			request = dns.DNSRecord.parse(query)
+			response = await self._resolver.resolve(request)
+			answer = response.pack()
+
+			if len(answer) > DotUdpServer.max_udp_size:
+				answer = response.truncate().pack()
+
 		except dns.DNSError as exc:
-			logging.error(repr(exc))
-			self._transport.sendto(dns.DNSRecord(dns.DNSHeader(rcode=getattr(dns.RCODE, 'FORMERR'))).pack(), client)
-			return
+			logging.error('DotUdpServer::process_query' + repr(exc))
+			answer = dns.DNSRecord(dns.DNSHeader(rcode=getattr(dns.RCODE, 'FORMERR'))).pack()
 
-		logging.info('DotUdpServer::process_query [%s#%d<%d>] %s %r' % (client[0], client[1], request.header.id, dns.OPCODE.get(request.header.opcode), request.q))
-		rtt = time.monotonic()
-		response = await self._resolver.resolve(request)
-		rtt = time.monotonic() - rtt
-		logging.info('DotUdpServer::process_query [%s#%d<%d>] %s(%.0fms) %r' % (client[0], client[1], response.header.id, dns.RCODE.get(response.header.rcode), rtt * 1000.0, response.a))
+		except Exception as exc:
+			logging.error('DotUdpServer::process_query' + repr(exc))
+			response = request.reply()
+			response.header.rcode = getattr(dns.RCODE, 'SERVFAIL')
+			answer = response.pack()
 
-		answer = response.pack()
-
-		if len(answer) > self.max_udp_size:
-			truncated_response = response.truncate()
-			answer = truncated_response.pack()
-
-		self._transport.sendto(answer, client)
+		finally:
+			self._transport.sendto(answer, client)
 
 
-def main():
-	logging.basicConfig(level='INFO', format='[%(levelname)s] %(message)s')
-	listen_address = ('127.0.0.1', 5001)
+class DotTcpServer:
+	def __init__(self, resolver: DotResolver) -> None:
+		self._resolver = resolver
 
-	upstreams = \
-	(
-		DotUpstream(('1.1.1.1', 853), 'cloudflare-dns.com'),
-		DotUpstream(('1.0.0.1', 853), 'cloudflare-dns.com'),
-		# DotUpstream(('8.8.8.8', 853), 'dns.google'),
-		# DotUpstream(('9.9.9.9', 853), 'dns.quad9.net'),
-	)
+	async def service_client(self, reader, writer):
+		try:
+			while True:
+				prefix = await reader.readexactly(2)
+				query = await reader.readexactly(struct.unpack('!H', prefix)[0])
 
-	resolver = DotResolver(upstreams)
-	loop = aio.get_event_loop()
-	transports = []
+				request = dns.DNSRecord.parse(query)
+				response = await self._resolver.resolve(request)
 
-	# Setup listening servers
-	logging.info('Starting UDP server listening on [%s#%d]' % (listen_address[0], listen_address[1]))
-	udp_listen = loop.create_datagram_endpoint(lambda: DotUdpServer(resolver), listen_address, reuse_address=True)
-	transport, _ = loop.run_until_complete(udp_listen)
-	transports.append(transport)
-	# print('Starting TCP server listening on %s#%d' % (listen_host, listen_port))
-	# tcp_listen = loop.create_server(lambda: TcpDotProtocol(resolver), listen_host, listen_port, reuse_address=True)
-	# transport = loop.run_until_complete(tcp_listen)
-	# transports.append(transport)
+				answer = response.pack()
+				writer.write(struct.pack('!H', len(answer)) + answer)
+				await writer.drain()
 
-	# Serve forever
-	try:
-		loop.run_forever()
-	except (KeyboardInterrupt, SystemExit):
-		pass
+				if reader.at_eof():
+					break
 
-	# Close listening servers
-	for transport in transports:
-		if not transport.is_closing():
-			transport.close()
+		except aio.IncompleteReadError:
+			pass
 
-	# Disconnect from all upstream servers
-	loop.run_until_complete(resolver.close())
+		except dns.DNSError as exc:
+			logging.error('DotTcpServer::service_client' + repr(exc))
+			writer.write(dns.DNSRecord(dns.DNSHeader(rcode=getattr(dns.RCODE, 'FORMERR'))).pack())
+			await writer.drain()
 
-	loop.run_until_complete(loop.shutdown_asyncgens())
-	loop.run_until_complete(aio.sleep(0.3))
-	loop.close()
+		except Exception as exc:
+			logging.error('DotTcpServer::service_client' + repr(exc))
+
+		finally:
+			if not writer.is_closing():
+				writer.close()
+				await writer.wait_closed()
 
 
 if __name__ == '__main__':
