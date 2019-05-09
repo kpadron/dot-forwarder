@@ -3,7 +3,7 @@ import struct, random, ssl
 import argparse, logging
 import asyncio as aio
 import dnslib as dns
-from typing import Sequence
+from typing import Sequence, Tuple
 
 def main():
 	loop = aio.get_event_loop()
@@ -74,9 +74,27 @@ def main():
 
 
 class DotStream:
+	"""
+	A DNS over TLS stream connection to a upstream server.
+
+	Attributes:
+		max_retries: The maximum number of retry attempts per send_query.
+	"""
 	max_retries: int = 1
 
-	def __init__(self, address: tuple, authname: str) -> None:
+	def __init__(self, address: Tuple[str, int], authname: str) -> None:
+		"""
+		Initialize a DotStream instance.
+
+		Args:
+			address: The (host, port) tuple of the upstream server.
+			authname: The hostname to use for verifying the upstream server.
+		
+		Attributes:
+			address: The (host, port) tuple of the upstream server.
+			authname: The hostname to use for verifying the upstream server.
+			rtt: The estimated RTT to the upstream server.
+		"""
 		self.address = address
 		self.authname = authname
 		self.rtt = 0.0
@@ -87,14 +105,18 @@ class DotStream:
 		self._wlock = aio.Lock()
 
 	def is_closed(self) -> bool:
+		"""Returns a boolean indicating if the transport stream is closed."""
 		return self._stream is None or self._stream[1].is_closing()
 
 	async def connect(self) -> None:
+		"""Asynchronously connect to the upstream server if not yet connected."""
 		async with self._clock:
 			if self.is_closed():
+				# TODO: Refactor to have more manual control over TCP and TLS connection (TCP Fast Open...)
 				self._stream = await aio.open_connection(*self.address, ssl=self._context, server_hostname=self.authname)
 
 	async def disconnect(self) -> None:
+		"""Asynchronously disconnect from the upstream server if currently connected."""
 		async with self._clock:
 			if self._stream is not None:
 				writer = self._stream[1]
@@ -103,7 +125,20 @@ class DotStream:
 					writer.close()
 					await writer.wait_closed()
 
-	async def send_query(self, query: bytes) -> None:
+	async def send_query(self, query: bytes) -> bool:
+		"""
+		Asynchronously send a DNS query to the upstream server.
+
+		Args:
+			query: The UDP wireformat DNS query packet to forward.
+
+		Returns:
+			True if query is successfully sent, False otherwise.
+
+		Note:
+			DNS query is formatted before being sent per RFC7858 including two-octet length prefix
+			https://tools.ietf.org/html/rfc7858
+		"""
 		prefix = struct.pack('!H', len(query))
 
 		for _ in range(DotStream.max_retries + 1):
@@ -124,17 +159,30 @@ class DotStream:
 		return False
 
 	async def recv_answer(self) -> bytes:
-		async with self._rlock:
-			try:
+		"""
+		Asynchronously receive a DNS answer from the upstream server.
+
+		Returns:
+			The UDP wireformat DNS answer packet.
+		"""
+		try:
+			async with self._rlock:
 				reader = self._stream[0]
 				prefix = await reader.readexactly(2)
 				return await reader.readexactly(struct.unpack('!H', prefix)[0])
 
-			except Exception:
-				return b''
+		except Exception:
+			return b''
 
 
 class DotResolver:
+	"""
+	A DNS over TLS resolver that forwards requests to configured upstream servers.
+
+	Attributes:
+		max_retries: The maximum number of retry attempts per resolution.
+		request_timeout: The maximum wait time per resolution (in seconds).
+	"""
 	max_retries: int = 2
 	request_timeout: float = 3.5
 
@@ -145,20 +193,20 @@ class DotResolver:
 		self._events = {}
 
 	async def close(self) -> None:
+		"""Asynchronously closes all connections to upstream servers."""
 		for upstream in self._upstreams:
 			await upstream.disconnect()
 
 	async def resolve(self, request: dns.DNSRecord) -> dns.DNSRecord:
 		"""
-		Resolves a DNS request asynchronously via a DNS over TLS upstream server.
+		Resolves a DNS request asynchronously via forwarding to a DNS over TLS upstream server.
 
-		Params:
-			request - The DNS request to resolve (modified by this method)
+		Args:
+			request: The DNS request to resolve (modified by this method).
 
 		Returns:
 			The corresponding DNS response.
 		"""
-
 		try:
 			# Get running event loop to determine RTT
 			loop = aio.get_event_loop()
