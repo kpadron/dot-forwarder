@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-from typing import Sequence
-import struct, random, time
-import argparse, logging, copy
+import struct, random, ssl
+import argparse, logging
 import asyncio as aio
 import dnslib as dns
-# import dnslib.server as dns_server
+from typing import Sequence
 
 def main():
 	loop = aio.get_event_loop()
@@ -28,7 +27,7 @@ def main():
 	logging.info('Starting DNS over TLS proxy server')
 	logging.info('Args: %r' % (vars(args)))
 
-	# Setup upstream configuration
+	# Configure upstream servers
 	upstreams = []
 	for upstream, authname in zip(args.upstreams, args.authnames):
 		upstreams.append(DotStream((upstream, 853), authname))
@@ -80,6 +79,8 @@ class DotStream:
 	def __init__(self, address: tuple, authname: str) -> None:
 		self.address = address
 		self.authname = authname
+		self.rtt = 0.0
+		self._context = ssl.create_default_context()
 		self._stream = None
 		self._clock = aio.Lock()
 		self._rlock = aio.Lock()
@@ -91,7 +92,7 @@ class DotStream:
 	async def connect(self) -> None:
 		async with self._clock:
 			if self.is_closed():
-				self._stream = await aio.open_connection(*self.address, ssl=True, server_hostname=self.authname)
+				self._stream = await aio.open_connection(*self.address, ssl=self._context, server_hostname=self.authname)
 
 	async def disconnect(self) -> None:
 		async with self._clock:
@@ -103,32 +104,34 @@ class DotStream:
 					await writer.wait_closed()
 
 	async def send_query(self, query: bytes) -> None:
+		prefix = struct.pack('!H', len(query))
+
 		for _ in range(DotStream.max_retries + 1):
 			try:
 				await self.connect()
 
 				async with self._wlock:
 					writer = self._stream[1]
-					writer.write(struct.pack('!H', len(query)) + query)
+					writer.write(prefix + query)
 					await writer.drain()
 
 				return True
 
-			except Exception as exc:
-				logging.error('DotStream::send_query: ' + repr(exc))
+			except ConnectionError as exc:
+				logging.error('DotStream::send_query %r: %r' % (self.address, exc))
 				await self.disconnect()
 
 		return False
 
 	async def recv_answer(self) -> bytes:
-		try:
-			async with self._rlock:
+		async with self._rlock:
+			try:
 				reader = self._stream[0]
 				prefix = await reader.readexactly(2)
 				return await reader.readexactly(struct.unpack('!H', prefix)[0])
 
-		except Exception:
-			return b''
+			except Exception:
+				return b''
 
 
 class DotResolver:
@@ -146,7 +149,20 @@ class DotResolver:
 			await upstream.disconnect()
 
 	async def resolve(self, request: dns.DNSRecord) -> dns.DNSRecord:
+		"""
+		Resolves a DNS request asynchronously via a DNS over TLS upstream server.
+
+		Params:
+			request - The DNS request to resolve (modified by this method)
+
+		Returns:
+			The corresponding DNS response.
+		"""
+
 		try:
+			# Get running event loop to determine RTT
+			loop = aio.get_event_loop()
+
 			# Create skeleton DNS response
 			response = request.reply()
 
@@ -154,15 +170,21 @@ class DotResolver:
 			query_id = self._queries % 65536
 			self._queries += 1
 
+			# Reset upstream RTTs to prevent drift
+			if self._queries % 10000 == 0:
+				for upstream in self._upstreams:
+					upstream.rtt = 0.0
+
 			# Add request to active tracking
 			self._events[query_id] = aio.Event()
 			request.header.id = query_id
 
 			for _ in range(DotResolver.max_retries + 1):
-				# Select upstream server to forward to
-				upstream = self._select_upstream_random()
+				# Select a upstream server to forward to
+				upstream = self._select_upstream_rtt()
 
 				# Forward a query packet to the upstream server
+				rtt = loop.time()
 				if await upstream.send_query(request.pack()):
 					break
 			else:
@@ -178,13 +200,17 @@ class DotResolver:
 			reply = self._responses[query_id]
 			response.add_answer(*reply.rr)
 			response.add_auth(*reply.auth)
-			# response.add_ar(*reply.ar)
+			response.add_ar(*reply.ar)
 
 		except Exception as exc:
-			logging.error('DotResolver::resolve: %r %d ' % (upstream.address, query_id) + repr(exc))
+			logging.error('DotResolver::resolve %r %d: %r' % (upstream.address, query_id, exc))
 			response.header.rcode = getattr(dns.RCODE, 'SERVFAIL')
 
 		finally:
+			# Update RTT estimation for selected upstream server
+			rtt = loop.time() - rtt
+			upstream.rtt = 0.875 * upstream.rtt + 0.125 * rtt
+
 			# Remove this request from tracking
 			self._responses.pop(query_id, None)
 			self._events.pop(query_id, None)
@@ -197,8 +223,8 @@ class DotResolver:
 			answer = await upstream.recv_answer()
 
 			# An error occurred with the upstream connection
-			if answer == b'':
-				raise Exception('failed to receive DNS answer from upstream')
+			if not answer:
+				raise Exception('failed to receive DNS answer from upstream server')
 
 			# Parse DNS answer packet into a response
 			response = dns.DNSRecord.parse(answer)
@@ -209,13 +235,13 @@ class DotResolver:
 				self._events[response.header.id].set()
 
 		except Exception as exc:
-			logging.error('DotResolver::_process_response: ' + repr(exc))
+			logging.error('DotResolver::_process_response %r: %r' % (upstream.address, exc))
 
 	def _select_upstream_random(self) -> DotStream:
 		return random.choice(self._upstreams)
 
 	def _select_upstream_rtt(self) -> DotStream:
-		max_rtt: float = max(upstream.rtt for upstream in self._upstreams)
+		max_rtt:float = max(upstream.rtt for upstream in self._upstreams)
 		return random.choices(self._upstreams, tuple(max_rtt - upstream.rtt + 1.0 for upstream in self._upstreams))[0]
 
 
@@ -226,19 +252,13 @@ class DotUdpServer(aio.DatagramProtocol):
 		self._resolver = resolver
 		self._transport = None
 
-	def connection_made(self, transport):
+	def connection_made(self, transport: aio.DatagramTransport) -> None:
 		self._transport = transport
 
-	def connection_lost(self, exc):
-		logging.error(repr(exc))
+	def datagram_received(self, data: bytes, addr: tuple) -> None:
+		aio.create_task(self._process_query(addr, data))
 
-	def datagram_received(self, data, addr):
-		aio.create_task(self.process_query(addr, data))
-
-	def error_received(self, exc):
-		logging.error('DotUdpServer::error_received: ' + repr(exc))
-
-	async def process_query(self, client: tuple, query: bytes) -> None:
+	async def _process_query(self, client: tuple, query: bytes) -> None:
 		try:
 			# Parse DNS query packet into a request
 			request = dns.DNSRecord.parse(query)
@@ -249,15 +269,11 @@ class DotUdpServer(aio.DatagramProtocol):
 			if len(answer) > DotUdpServer.max_udp_size:
 				answer = response.truncate().pack()
 
-		except dns.DNSError as exc:
+		# Failed to parse DNS query
+		except dns.DNSError:
 			answer = dns.DNSRecord(dns.DNSHeader(rcode=getattr(dns.RCODE, 'FORMERR'))).pack()
 
-		except Exception as exc:
-			logging.error('DotUdpServer::process_query: ' + repr(exc))
-			response = request.reply()
-			response.header.rcode = getattr(dns.RCODE, 'SERVFAIL')
-			answer = response.pack()
-
+		# Reply to client with DNS answer
 		finally:
 			self._transport.sendto(answer, client)
 
@@ -266,7 +282,11 @@ class DotTcpServer:
 	def __init__(self, resolver: DotResolver) -> None:
 		self._resolver = resolver
 
-	async def service_client(self, reader, writer):
+	async def service_client(self, reader: aio.StreamReader, writer: aio.StreamWriter) -> None:
+		"""
+		Service DNS requests from a client over a TCP connection.
+		"""
+
 		try:
 			while True:
 				prefix = await reader.readexactly(2)
@@ -279,19 +299,16 @@ class DotTcpServer:
 				writer.write(struct.pack('!H', len(answer)) + answer)
 				await writer.drain()
 
-				if reader.at_eof():
-					break
-
+		# Connection likely closed or reset by client
 		except aio.IncompleteReadError:
 			pass
 
-		except dns.DNSError as exc:
+		# Failed to parse DNS query
+		except dns.DNSError:
 			writer.write(dns.DNSRecord(dns.DNSHeader(rcode=getattr(dns.RCODE, 'FORMERR'))).pack())
 			await writer.drain()
 
-		except Exception as exc:
-			logging.error('DotTcpServer::service_client: ' + repr(exc))
-
+		# Cleanly close client connection
 		finally:
 			if not writer.is_closing():
 				writer.close()
