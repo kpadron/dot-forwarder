@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import struct, random, ssl
+import struct, random
+import socket, ssl
 import argparse, logging
 import asyncio as aio
 import dnslib as dns
@@ -82,14 +83,15 @@ class DotStream:
 	"""
 	max_retries: int = 1
 
-	def __init__(self, address: Tuple[str, int], authname: str) -> None:
+	def __init__(self, address: Tuple[str, int], authname: str, loop: aio.AbstractEventLoop = None) -> None:
 		"""
 		Initialize a DotStream instance.
 
 		Args:
 			address: The (host, port) tuple of the upstream server.
 			authname: The hostname to use for verifying the upstream server.
-		
+			loop: The async event loop to run on (defaults to current running loop).
+
 		Attributes:
 			address: The (host, port) tuple of the upstream server.
 			authname: The hostname to use for verifying the upstream server.
@@ -98,11 +100,12 @@ class DotStream:
 		self.address = address
 		self.authname = authname
 		self.rtt = 0.0
-		self._context = ssl.create_default_context()
 		self._stream = None
-		self._clock = aio.Lock()
-		self._rlock = aio.Lock()
-		self._wlock = aio.Lock()
+		self._context = ssl.create_default_context()
+		self._loop = loop or aio.get_event_loop()
+		self._clock = aio.Lock(loop=self._loop)
+		self._rlock = aio.Lock(loop=self._loop)
+		self._wlock = aio.Lock(loop=self._loop)
 
 	def is_closed(self) -> bool:
 		"""Returns a boolean indicating if the transport stream is closed."""
@@ -112,8 +115,23 @@ class DotStream:
 		"""Asynchronously connect to the upstream server if not yet connected."""
 		async with self._clock:
 			if self.is_closed():
-				# TODO: Refactor to have more manual control over TCP and TLS connection (TCP Fast Open...)
-				self._stream = await aio.open_connection(*self.address, ssl=self._context, server_hostname=self.authname)
+				# Create non-blocking TCP socket with keep-alive and disable nagle's algorithm
+				sock = socket.socket()
+				sock.setblocking(False)
+				sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+				sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 1)
+				sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+				sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+				sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+				# Connect to upstream server over TCP transport
+				await self._loop.sock_connect(sock, self.address)
+
+				# Connect to upstream server over encrypted TLS session
+				self._stream = await aio.open_connection(
+					loop=self._loop, ssl=self._context,
+					sock=sock, server_hostname=self.authname,
+					ssl_handshake_timeout=2.5)
 
 	async def disconnect(self) -> None:
 		"""Asynchronously disconnect from the upstream server if currently connected."""
@@ -186,8 +204,10 @@ class DotResolver:
 	max_retries: int = 2
 	request_timeout: float = 3.5
 
-	def __init__(self, upstreams: Sequence[DotStream]):
+	def __init__(self, upstreams: Sequence[DotStream], loop: aio.AbstractEventLoop = None):
+		# TODO: Document this
 		self._upstreams = upstreams
+		self._loop = loop or aio.get_event_loop()
 		self._queries = 0
 		self._responses = {}
 		self._events = {}
@@ -208,9 +228,6 @@ class DotResolver:
 			The corresponding DNS response.
 		"""
 		try:
-			# Get running event loop to determine RTT
-			loop = aio.get_event_loop()
-
 			# Create skeleton DNS response
 			response = request.reply()
 
@@ -226,7 +243,7 @@ class DotResolver:
 					upstream.rtt = 0.0
 
 			# Add request to active tracking
-			self._events[query_id] = aio.Event()
+			self._events[query_id] = aio.Event(loop=self._loop)
 			request.header.id = query_id
 
 			for _ in range(DotResolver.max_retries + 1):
@@ -234,17 +251,17 @@ class DotResolver:
 				upstream = self._select_upstream_rtt()
 
 				# Forward a query packet to the upstream server
-				rtt = loop.time()
+				rtt = self._loop.time()
 				if await upstream.send_query(request.pack()):
 					break
 			else:
 				raise Exception('max retries reached')
 
 			# Schedule the response to be processed
-			aio.create_task(self._process_response(upstream))
+			self._loop.create_task(self._process_response(upstream))
 
 			# Wait for request to be serviced
-			await aio.wait_for(self._events[query_id].wait(), DotResolver.request_timeout)
+			await aio.wait_for(self._events[query_id].wait(), DotResolver.request_timeout, loop=self._loop)
 
 			# Fill out response
 			reply = self._responses[query_id]
@@ -258,7 +275,7 @@ class DotResolver:
 
 		finally:
 			# Update RTT estimation for selected upstream server
-			rtt = loop.time() - rtt
+			rtt = self._loop.time() - rtt
 			upstream.rtt = 0.875 * upstream.rtt + 0.125 * rtt
 
 			# Remove this request from tracking
@@ -298,15 +315,16 @@ class DotResolver:
 class DotUdpServer(aio.DatagramProtocol):
 	max_udp_size: int = 512
 
-	def __init__(self, resolver: DotResolver) -> None:
+	def __init__(self, resolver: DotResolver, loop: aio.AbstractEventLoop = None) -> None:
 		self._resolver = resolver
+		self._loop = loop or aio.get_event_loop()
 		self._transport = None
 
 	def connection_made(self, transport: aio.DatagramTransport) -> None:
 		self._transport = transport
 
 	def datagram_received(self, data: bytes, addr: tuple) -> None:
-		aio.create_task(self._process_query(addr, data))
+		self._loop.create_task(self._process_query(addr, data))
 
 	async def _process_query(self, client: tuple, query: bytes) -> None:
 		try:
