@@ -7,8 +7,6 @@ import dnslib as dns
 from typing import Sequence, Tuple
 
 def main():
-	loop = aio.get_event_loop()
-
 	# Handle command line arguments
 	parser = argparse.ArgumentParser()
 	parser.add_argument('-l', '--listen-address', nargs='+', default=['127.0.0.1', '::1'],
@@ -27,6 +25,7 @@ def main():
 	logging.basicConfig(level='INFO', format='[%(levelname)s] %(message)s')
 	logging.info('Starting DNS over TLS proxy server')
 	logging.info('Args: %r' % (vars(args)))
+	loop = aio.get_event_loop()
 
 	# Configure upstream servers
 	upstreams = []
@@ -205,7 +204,13 @@ class DotResolver:
 	request_timeout: float = 3.5
 
 	def __init__(self, upstreams: Sequence[DotStream], loop: aio.AbstractEventLoop = None):
-		# TODO: Document this
+		"""
+		Initialize a DotResolver instance.
+
+		Args:
+			upstreams: A sequence of DotStream instances to use for forwarding queries.
+			loop: The async event loop to run on (defaults to current running loop).
+		"""
 		self._upstreams = upstreams
 		self._loop = loop or aio.get_event_loop()
 		self._queries = 0
@@ -351,18 +356,16 @@ class DotTcpServer:
 		self._resolver = resolver
 
 	async def service_client(self, reader: aio.StreamReader, writer: aio.StreamWriter) -> None:
-		"""
-		Service DNS requests from a client over a TCP connection.
-		"""
-
 		try:
 			while True:
+				# Parse DNS query packet into a request
 				prefix = await reader.readexactly(2)
 				query = await reader.readexactly(struct.unpack('!H', prefix)[0])
-
 				request = dns.DNSRecord.parse(query)
+
 				response = await self._resolver.resolve(request)
 
+				# Pack DNS response into answer
 				answer = response.pack()
 				writer.write(struct.pack('!H', len(answer)) + answer)
 				await writer.drain()
