@@ -169,7 +169,7 @@ class DotStream:
 
 				return True
 
-			except ConnectionError as exc:
+			except Exception as exc:
 				logging.error('DotStream::send_query %r: %r' % (self.address, exc))
 				await self.disconnect()
 
@@ -189,6 +189,8 @@ class DotStream:
 				return await reader.readexactly(struct.unpack('!H', prefix)[0])
 
 		except Exception:
+			logging.error('DotStream::recv_answer %r: %r' % (self.address, exc))
+			await self.disconnect()
 			return b''
 
 
